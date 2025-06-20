@@ -1,0 +1,1591 @@
+
+========================================
+# POČETAK DATOTEKE: main.py
+========================================
+import customtkinter as ctk
+from config import SVJETLO_ZELENA, TAMNO_TIRKIZNA
+import sqlite3
+import tkinter as tk
+from core_functions import CoreFunctions
+from search_functions import SearchFunctions
+from article_functions import ArticleFunctions
+from receipt_functions import ReceiptFunctions
+from io_and_categories import IOAndCategories
+from ui_components import setup_ui
+from windows import WindowManager
+import qrcode
+from PIL import Image, ImageTk
+from tkinter import messagebox
+
+print("Tkinter verzija:", tk.TkVersion)
+
+class POSApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Sistem za naplatu - trgovačka radnja 'Ćorović'")
+        self.root.iconbitmap(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\cashier.ico")
+        self.ukupno = 0.0
+
+        self.db_conn = sqlite3.connect("pos_database.db")
+        self.initialize_database()
+
+        # Inicijalizacija WindowManager prije setup_ui
+        self.win = WindowManager(self)
+
+        # Postavljanje UI prije inicijalizacije modula
+        setup_ui(self.root, self)
+
+        # Inicijalizacija svih modula nakon setup_ui
+        self.core = CoreFunctions(self, self.db_conn)
+        self.search = SearchFunctions(self.core)
+        self.io_categories = IOAndCategories(self.core)
+        self.article = ArticleFunctions(self.core, self.io_categories)
+        self.receipt = ReceiptFunctions(self.core)
+
+        # Postavljanje bindinga nakon inicijalizacije svih modula
+        self.core.setup_basic_bindings()
+        self.root.bind("<Delete>", self.article.obrisi_artikal)
+        self.root.bind("<Caps_Lock>", lambda event: self.receipt.zavrsi_i_novi_racun())
+
+        # Učitavanje kategorija iz baze pri pokretanju
+        self.ucitaj_kategorije_iz_baze()
+
+        self.clear_active_items()
+
+        self.root.update_idletasks()
+        self.root.after(100, lambda: self.root.state('zoomed'))
+
+    def initialize_database(self):
+        c = self.db_conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS artikli (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            barkod TEXT UNIQUE,
+            naziv TEXT,
+            cijena REAL,
+            kategorija TEXT DEFAULT '',
+            image_path TEXT
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS aktivni_racuni (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            naziv TEXT,
+            boja TEXT,
+            ukupno REAL
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS aktivne_stavke (
+            racun_id INTEGER,
+            sifra TEXT,
+            naziv TEXT,
+            barkod TEXT,
+            cijena REAL,
+            kolicina REAL,
+            ukupna_cijna REAL,
+            FOREIGN KEY (racun_id) REFERENCES aktivni_racuni(id)
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS racuni (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            datum_vrijeme TEXT,
+            ukupno REAL
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS racun_stavke (
+            racun_id INTEGER,
+            sifra TEXT,
+            naziv TEXT,
+            barkod TEXT,
+            cijena REAL,
+            kolicina REAL,
+            ukupna_cijena REAL,
+            FOREIGN KEY (racun_id) REFERENCES racuni(id)
+        )''')
+        c.execute("SELECT id FROM aktivni_racuni WHERE naziv = 'Račun 1'")
+        if not c.fetchone():
+            c.execute("INSERT INTO aktivni_racuni (naziv, boja, ukupno) VALUES (?, ?, ?)", ("Račun 1", "#F5EFE7", 0.0))
+        self.db_conn.commit()
+
+    def ucitaj_kategorije_iz_baze(self):
+        """Učitava artikle iz baze i dodeljuje ih odgovarajućim kategorijama u WindowManager-u."""
+        try:
+            c = self.db_conn.cursor()
+            c.execute("SELECT id, barkod, naziv, cijena, kategorija FROM artikli WHERE kategorija != ''")
+            artikli = c.fetchall()
+            for artikal in artikli:
+                sifra, barkod, naziv, cijena, kategorija = artikal
+                if kategorija in self.win.kategorije:
+                    self.win.kategorije[kategorija].append((sifra, barkod, naziv, cijena))
+        except sqlite3.Error as e:
+            messagebox.showerror("Greška", f"Došlo je do greške pri učitavanju kategorija: {e}")
+
+    def clear_active_items(self):
+        c = self.db_conn.cursor()
+        c.execute("DELETE FROM aktivne_stavke WHERE racun_id = ?", (self.core.trenutni_racun_id,))
+        c.execute("UPDATE aktivni_racuni SET ukupno = 0.0 WHERE id = ?", (self.core.trenutni_racun_id,))
+        self.db_conn.commit()
+        self.core.osvjezi_trenutni_racun()
+
+    def show_qr_codes(self):
+        items = self.tree.get_children()
+        if not items:
+            messagebox.showinfo("Info", "Nema artikala za prikaz QR kodova.")
+            return
+
+        qr_window = ctk.CTkToplevel(self.root)
+        qr_window.title("QR Kodovi Artikala")
+        qr_window.geometry("600x600")  # Povećana veličina prozora
+        qr_window.configure(fg_color=SVJETLO_ZELENA)
+
+        # Osiguravanje da prozor bude vidljiv i aktivan
+        qr_window.lift()
+        qr_window.focus_force()
+        qr_window.attributes('-topmost', True)
+        qr_window.grab_set()
+
+        qr_frame = ctk.CTkFrame(qr_window, fg_color=SVJETLO_ZELENA)
+        qr_frame.pack(pady=10)
+
+        qr_label = ctk.CTkLabel(qr_frame, text="")
+        qr_label.pack()
+
+        details_label = ctk.CTkLabel(qr_window, text="", font=("Arial", 18), text_color="#000000")  # Povećan font
+        details_label.pack(pady=10)
+
+        item_list = list(items)
+        current_index = 0
+
+        def show_current_item():
+            nonlocal current_index
+            if current_index >= len(item_list):
+                qr_window.destroy()
+                return
+            item = item_list[current_index]
+            values = self.tree.item(item, "values")
+            barcode = values[2]  # Barkod je treća kolona (indeks 2)
+            # Generisanje QR koda
+            qr = qrcode.QRCode(version=1, box_size=10, border=5)
+            qr.add_data(barcode)
+            qr.make(fit=True)
+            img = qr.make_image(fill='black', back_color='white')
+            img = img.resize((300, 300))  # Povećana veličina QR koda
+            ctk_img = ctk.CTkImage(light_image=img, size=(300, 300))  # Korišćenje CTkImage
+            qr_label.configure(image=ctk_img)
+            qr_label.image = ctk_img  # Čuvanje reference na sliku
+            details_text = f"Šifra: {values[0]}\nNaziv: {values[1]}\nBarkod: {values[2]}\nOsn. Cijena: {values[3]}\nKoličina: {values[4]}\nUku. Cijena: {values[5]}"
+            details_label.configure(text=details_text)
+
+        def next_item(event=None):
+            nonlocal current_index
+            current_index += 1
+            show_current_item()
+
+        qr_window.bind("<Return>", next_item)
+
+        show_current_item()
+
+    def __del__(self):
+        if self.db_conn:
+            self.db_conn.close()
+
+if __name__ == "__main__":
+    root = ctk.CTk()
+    app = POSApp(root)
+    root.mainloop()
+========================================
+# KRAJ DATOTEKE: main.py
+========================================
+
+
+========================================
+# POČETAK DATOTEKE: receipt_functions.py
+========================================
+import tkinter as tk
+from config import SVJETLO_ZELENA, TAMNO_TIRKIZNA
+from tkinter import messagebox
+import sqlite3
+import customtkinter as ctk
+import tkinter.ttk as ttk
+from database import dodaj_aktivni_racun, dohvati_aktivne_racune, zavrsi_racun
+from article_functions import generisi_qr_kodove
+
+class ReceiptFunctions:
+    def __init__(self, core):
+        self.core = core
+        self.app = core.app
+        self.db_conn = core.db_conn
+        self.setup_receipt_bindings()
+
+    def setup_receipt_bindings(self):
+        self.app.zavrsi_novi_btn.configure(command=self.zavrsi_i_novi_racun)
+        self.app.svi_racuni_btn.configure(command=self.prikazi_aktivne_racune)
+        self.app.raniji_racuni_btn.configure(command=self.prikazi_ranije_racune)
+        self.app.dodatno_entry.bind("<Return>", self.update_total_with_dodatno)
+        self.app.root.bind("<Caps_Lock>", lambda event: self.zavrsi_i_novi_racun())
+
+    def update_total_with_dodatno(self, event=None):
+        try:
+            dodatno = float(self.app.dodatno_var.get().replace(",", ".")) if self.app.dodatno_var.get() else 0.0
+            ukupno_artikala = sum(float(self.app.tree.item(item, "values")[5].replace(" KM", "")) for item in self.app.tree.get_children())
+            nova_ukupna_cijena = ukupno_artikala + dodatno
+            self.app.ukupno = nova_ukupna_cijena
+            self.app.cijena_label.configure(text=f"{nova_ukupna_cijena:.2f} KM")
+        except ValueError:
+            messagebox.showerror("Greška", "Unesi validan iznos za 'Dodatno'!")
+        self.core.focus_barkod_entry()
+
+    def zavrsi_i_novi_racun(self):
+        if not self.app.tree.get_children():
+            messagebox.showwarning("Info", "Nema artikala za završetak računa!")
+            return
+        try:
+            if self.core.trenutni_racun_id != 1:
+                zavrsi_racun(self.db_conn, self.core.trenutni_racun_id)
+                ukupno = self.app.ukupno if self.app.ukupno is not None else 0.0
+                messagebox.showinfo("Info", f"Račun je završen i iznosi: {ukupno:.2f} KM\nRačun je obrisan i vraćam se na Račun 1.")
+            else:
+                messagebox.showinfo("Info", "Račun 1 ne može biti obrisan, ostaje aktivan.")
+            self.core.resetuj_sve()
+            racuni = dohvati_aktivne_racune(self.db_conn)
+            for racun in racuni:
+                if racun[1] == "Račun 1":
+                    self.core.trenutni_racun_id = racun[0]
+                    self.app.trenutni_racun_label.configure(text="Račun 1")
+                    break
+            else:
+                self.core.trenutni_racun_id = dodaj_aktivni_racun(self.db_conn, "Račun 1")
+                self.app.trenutni_racun_label.configure(text="Račun 1")
+            self.core.osvjezi_trenutni_racun()
+        except Exception as e:
+            messagebox.showerror("Greška", f"Došlo je do greške prilikom završavanja računa: {e}")
+        self.core.focus_barkod_entry()
+
+    def prikazi_aktivne_racune(self):
+        prozor = ctk.CTkToplevel(self.app.root)
+        prozor.title("Svi aktivni računi")
+        prozor.geometry("500x600")
+        prozor.configure(fg_color=SVJETLO_ZELENA)
+        prozor.transient(self.app.root)
+        prozor.lift()
+        title_frame = ctk.CTkFrame(prozor, fg_color=TAMNO_TIRKIZNA, corner_radius=10)
+        title_frame.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(title_frame, text="Svi aktivni računi", font=self.core.FONT_BOLD, text_color="#000000").pack(side="left", padx=10)
+        ctk.CTkButton(title_frame, text="X", command=prozor.destroy, width=30, fg_color="#FF6F61", hover_color="#E65A50").pack(side="right", padx=5)
+        tree_frame = ctk.CTkFrame(prozor, fg_color="white", corner_radius=10)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        tree = ttk.Treeview(tree_frame, columns=("ID", "Naziv", "Ukupno"), show="headings")
+        tree.heading("ID", text="ID")
+        tree.heading("Naziv", text="Naziv")
+        tree.heading("Ukupno", text="Ukupno (KM)")
+        tree.column("ID", width=50)
+        tree.column("Naziv", width=200)
+        tree.column("Ukupno", width=100)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        racuni = dohvati_aktivne_racune(self.db_conn)
+        for racun in racuni:
+            ukupno = racun[3] if racun[3] is not None else 0.0
+            tree.insert("", "end", values=(racun[0], racun[1], f"{ukupno:.2f} KM"))
+        def prebaci_na_racun(event=None):
+            selektovano = tree.selection()
+            if not selektovano:
+                messagebox.showwarning("Info", "Nijedan račun nije selektovan!")
+                return
+            item = selektovano[0]
+            self.core.trenutni_racun_id = int(tree.item(item, "values")[0])
+            naziv_racuna = tree.item(item, "values")[1]
+            self.app.trenutni_racun_label.configure(text=naziv_racuna)
+            self.core.osvjezi_trenutni_racun()
+            prozor.destroy()
+        def dodaj_novi_racun():
+            racuni = dohvati_aktivne_racune(self.db_conn)
+            novi_broj = len(racuni) + 1
+            naziv = f"Račun {novi_broj}"
+            novi_racun_id = dodaj_aktivni_racun(self.db_conn, naziv)
+            if novi_racun_id:
+                tree.insert("", "end", values=(novi_racun_id, naziv, "0,00 KM"))
+                self.core.trenutni_racun_id = novi_racun_id
+                self.app.trenutni_racun_label.configure(text=naziv)
+                self.core.osvjezi_trenutni_racun()
+                prozor.destroy()
+        ctk.CTkButton(prozor, text="Prebaci na račun", command=prebaci_na_racun, fg_color=TAMNO_TIRKIZNA, hover_color="#3A8B93").pack(side="left", padx=10, pady=10)
+        ctk.CTkButton(prozor, text="+ Novi račun", command=dodaj_novi_racun, fg_color=TAMNO_TIRKIZNA, hover_color="#3A8B93").pack(side="left", padx=10, pady=10)
+        tree.bind("<Double-1>", prebaci_na_racun)
+        self.core.focus_barkod_entry()
+
+    def dohvati_stavke_racuna(self, conn, racun_id):
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT a.barkod, a.naziv, rs.kolicina, rs.cijena
+            FROM racun_stavke rs
+            JOIN artikli a ON rs.barkod = a.barkod
+            WHERE rs.racun_id = ?
+        """, (racun_id,))
+        stavke = [
+            {'barkod': row[0], 'naziv': row[1], 'kolicina': row[2], 'cena': row[3]}
+            for row in cursor.fetchall()
+        ]
+        return stavke
+
+    def prikazi_ranije_racune(self):
+        prozor = ctk.CTkToplevel(self.app.root)
+        prozor.title("Raniji Računi")
+        prozor.geometry("800x600")
+        prozor.configure(fg_color=SVJETLO_ZELENA)
+        prozor.transient(self.app.root)
+        prozor.lift()
+        title_frame = ctk.CTkFrame(prozor, fg_color=TAMNO_TIRKIZNA, corner_radius=10)
+        title_frame.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(title_frame, text="Raniji Računi", font=self.core.FONT_BOLD, text_color="#000000").pack(side="left", padx=10)
+        ctk.CTkButton(title_frame, text="X", command=prozor.destroy, width=30, fg_color="#FF6F61", hover_color="#E65A50").pack(side="right", padx=5)
+        tree_frame = ctk.CTkFrame(prozor, fg_color="white", corner_radius=10)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        tree = ttk.Treeview(tree_frame, columns=("ID", "Datum i Vrijeme", "Ukupno"), show="headings")
+        tree.heading("ID", text="ID")
+        tree.heading("Datum i Vrijeme", text="Datum i Vrijeme")
+        tree.heading("Ukupno", text="Ukupno (KM)")
+        tree.column("ID", width=50)
+        tree.column("Datum i Vrijeme", width=200)
+        tree.column("Ukupno", width=100)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        try:
+            c = self.db_conn.cursor()
+            c.execute("SELECT id, datum_vrijeme, ukupno FROM racuni ORDER BY datum_vrijeme DESC")
+            racuni = c.fetchall()
+            for racun in racuni:
+                ukupno = racun[2] if racun[2] is not None else 0.0
+                tree.insert("", "end", values=(racun[0], racun[1], f"{ukupno:.2f} KM"))
+        except sqlite3.Error as e:
+            messagebox.showerror("Greška", f"Došlo je do greške: {e}")
+        def prikazi_stavke(event=None):
+            selektovano = tree.selection()
+            if not selektovano:
+                messagebox.showwarning("Info", "Nijedan račun nije selektovan!")
+                return
+            item = selektovano[0]
+            racun_id = tree.item(item, "values")[0]
+            stavke_prozor = ctk.CTkToplevel(self.app.root)
+            stavke_prozor.title(f"Stavke računa {racun_id}")
+            stavke_prozor.geometry("800x400")
+            stavke_prozor.configure(fg_color=SVJETLO_ZELENA)
+            stavke_prozor.transient(self.app.root)
+            stavke_prozor.lift()
+            title_frame = ctk.CTkFrame(stavke_prozor, fg_color=TAMNO_TIRKIZNA, corner_radius=10)
+            title_frame.pack(fill="x", padx=10, pady=5)
+            ctk.CTkLabel(title_frame, text=f"Stavke računa {racun_id}", font=self.core.FONT_BOLD, text_color="#000000").pack(side="left", padx=10)
+            ctk.CTkButton(title_frame, text="X", command=stavke_prozor.destroy, width=30, fg_color="#FF6F61", hover_color="#E65A50").pack(side="right", padx=5)
+            stavke_frame = ctk.CTkFrame(stavke_prozor, fg_color="white", corner_radius=10)
+            stavke_frame.pack(fill="both", expand=True, padx=10, pady=10)
+            stavke_tree = ttk.Treeview(stavke_frame, columns=("Šifra", "Naziv", "Barkod", "Cijena", "Količina", "Ukupna Cijena"), show="headings")
+            stavke_tree.heading("Šifra", text="Šifra")
+            stavke_tree.heading("Naziv", text="Naziv")
+            stavke_tree.heading("Barkod", text="Barkod")
+            stavke_tree.heading("Cijena", text="Cijena")
+            stavke_tree.heading("Količina", text="Količina")
+            stavke_tree.heading("Ukupna Cijena", text="Ukupna Cijena")
+            stavke_tree.column("Šifra", width=50)
+            stavke_tree.column("Naziv", width=200)
+            stavke_tree.column("Barkod", width=150)
+            stavke_tree.column("Cijena", width=100)
+            stavke_tree.column("Količina", width=100)
+            stavke_tree.column("Ukupna Cijena", width=100)
+            stavke_tree.pack(side="left", fill="both", expand=True)
+            scrollbar = ttk.Scrollbar(stavke_frame, orient="vertical", command=stavke_tree.yview)
+            stavke_tree.configure(yscrollcommand=scrollbar.set)
+            scrollbar.pack(side="right", fill="y")
+            try:
+                c = self.db_conn.cursor()
+                c.execute("SELECT sifra, naziv, barkod, cijena, kolicina, ukupna_cijena FROM racun_stavke WHERE racun_id = ?", (racun_id,))
+                stavke = c.fetchall()
+                for stavka in stavke:
+                    stavke_tree.insert("", "end", values=(stavka[0], stavka[1], stavka[2], f"{stavka[3]:.2f} KM", stavka[4], f"{stavka[5]:.2f} KM"))
+            except sqlite3.Error as e:
+                messagebox.showerror("Greška", f"Došlo je do greške: {e}")
+            stavke_za_qr = self.dohvati_stavke_racuna(self.db_conn, racun_id)
+            qr_btn = ctk.CTkButton(
+                stavke_prozor,
+                text="QR Kod",
+                command=lambda: self.prikazi_qr_kodove_za_racun(stavke_za_qr),
+                fg_color=TAMNO_TIRKIZNA,
+                hover_color="#3A8B93"
+            )
+            qr_btn.pack(pady=10)
+        tree.bind("<Double-1>", prikazi_stavke)
+        ctk.CTkButton(prozor, text="Prikaži stavke", command=prikazi_stavke, fg_color=TAMNO_TIRKIZNA, hover_color="#3A8B93").pack(pady=10)
+        self.core.focus_barkod_entry()
+
+    def prikazi_qr_kodove_za_racun(self, stavke):
+        prozor = ctk.CTkToplevel(self.app.root)
+        prozor.title("QR Kodovi Artikala")
+        prozor.geometry("600x400")
+        prozor.configure(fg_color=SVJETLO_ZELENA)
+        prozor.transient(self.app.root)
+        prozor.lift()
+        canvas = tk.Canvas(prozor)
+        scrollbar = ttk.Scrollbar(prozor, orient="vertical", command=canvas.yview)
+        scrollable_frame = ctk.CTkFrame(canvas, fg_color=SVJETLO_ZELENA)
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        qr_images = generisi_qr_kodove([{'barkod': s['barkod'], 'naziv': s['naziv']} for s in stavke])
+        for stavka, qr_image in zip(stavke, qr_images):
+            frame = ctk.CTkFrame(scrollable_frame, fg_color="white")
+            frame.pack(pady=10, padx=10, fill="x")
+            label = ctk.CTkLabel(frame, text=f"Artikal: {stavka['naziv']} ({stavka['barkod']})")
+            label.pack()
+            qr_label = tk.Label(frame, image=qr_image)
+            qr_label.image = qr_image
+            qr_label.pack()
+========================================
+# KRAJ DATOTEKE: receipt_functions.py
+========================================
+
+
+========================================
+# POČETAK DATOTEKE: reset_racuni.py
+========================================
+ SVJETLO_ZELENA
+
+# Povezivanje s bazom (prilagodi ime baze ako koristiš "pos.db" umjesto "pos_database.db")
+conn = sqlite3.connect("C:\\Users\\Danilo Ćorović\\Desktop\\POS SISTEM 5\\pos_database.db")
+c = conn.cursor()
+
+# Brisanje tablica
+c.execute("DROP TABLE IF EXISTS racun_stavke")
+c.execute("DROP TABLE IF EXISTS racuni")
+
+# Ponovno kreiranje tablica
+c.execute("""
+    CREATE TABLE racuni (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        datum_vrijeme TEXT,
+        ukupno REAL
+    )
+""")
+c.execute("""
+    CREATE TABLE racun_stavke (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        racun_id INTEGER,
+        sifra TEXT,
+        naziv TEXT,
+        barkod TEXT,
+        cijena REAL,
+        kolicina REAL,
+        ukupna_cijena REAL,
+        FOREIGN KEY (racun_id) REFERENCES racuni(id)
+    )
+""")
+
+conn.commit()
+conn.close()
+print("Tablice 'racuni' i 'racun_stavke' su resetovane.")
+========================================
+# KRAJ DATOTEKE: reset_racuni.py
+========================================
+
+
+========================================
+# POČETAK DATOTEKE: search_functions.py
+========================================
+import tkinter as tk
+from config import SVJETLO_ZELENA, TAMNO_TIRKIZNA
+from tkinter import messagebox
+import sqlite3
+import customtkinter as ctk
+import tkinter.ttk as ttk
+from database import pretrazi_barkod, pretrazi_sifru, dodaj_stavku_racuna, azuriraj_ukupno_racuna
+
+class SearchFunctions:
+    def __init__(self, core):
+        self.core = core
+        self.app = core.app
+        self.db_conn = core.db_conn
+        self.setup_search_bindings()
+
+    def setup_search_bindings(self):
+        self.app.barkod_entry.bind("<Return>", self.pretrazi_barkod)
+        self.app.naziv_entry.bind("<Return>", self.prikazi_nazive)
+        self.app.sifra_entry.bind("<Return>", self.pretrazi_sifru)
+
+    def prikazi_nazive(self, event):
+        naziv = self.app.naziv_var.get().strip()
+        if not naziv:
+            return
+        
+        try:
+            c = self.db_conn.cursor()
+            c.execute("SELECT id, barkod, naziv, cijena FROM artikli WHERE naziv LIKE ?", (f"%{naziv}%",))
+            rezultati = c.fetchall()
+            if rezultati:
+                if len(rezultati) > 1:
+                    prozor = ctk.CTkToplevel(self.app.root)
+                    prozor.title("Rezultati pretrage")
+                    prozor.geometry("1000x500")
+                    prozor.configure(fg_color=SVJETLO_ZELENA)
+                    prozor.transient(self.app.root)
+                    prozor.lift()
+
+                    title_frame = ctk.CTkFrame(prozor, fg_color=TAMNO_TIRKIZNA, corner_radius=10)
+                    title_frame.pack(fill="x", padx=10, pady=5)
+                    ctk.CTkLabel(title_frame, text="Rezultati pretrage", font=self.core.FONT_BOLD, text_color="#000000").pack(side="left", padx=10)
+                    ctk.CTkButton(title_frame, text="X", command=prozor.destroy, width=30, fg_color="#FF6F61", hover_color="#E65A50", font=self.core.FONT).pack(side="right", padx=5)
+
+                    tree_frame = ctk.CTkFrame(prozor, fg_color="white", corner_radius=10)
+                    tree_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+                    tree = ttk.Treeview(tree_frame, columns=("Šifra", "Naziv", "Barkod", "Cijena"), show="headings", selectmode="browse")
+                    tree.heading("Šifra", text="Šifra")
+                    tree.heading("Naziv", text="Naziv")
+                    tree.heading("Barkod", text="Barkod")
+                    tree.heading("Cijena", text="Cijena")
+                    tree.column("Šifra", width=50)
+                    tree.column("Naziv", width=200)
+                    tree.column("Barkod", width=150)
+                    tree.column("Cijena", width=100)
+                    tree.pack(side="left", fill="both", expand=True)
+
+                    scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+                    tree.configure(yscrollcommand=scrollbar.set)
+                    scrollbar.pack(side="right", fill="y")
+
+                    for sifra, barkod, naziv, cijena in rezultati:
+                        tree.insert("", "end", values=(sifra, naziv, barkod, f"{cijena:.2f} KM"))
+
+                    def dodaj_selektovano():
+                        selektovano = tree.selection()
+                        if not selektovano:
+                            messagebox.showwarning("Info", "Nijedan artikal nije selektovan!")
+                            return
+                        item = selektovano[0]
+                        sifra, naziv, barkod, cijena = tree.item(item, "values")
+                        cijena = float(cijena.replace(" KM", ""))
+                        kolicina = 1.0
+                        ukupna_cijena = cijena * kolicina
+                        for main_item in self.app.tree.get_children():
+                            if self.app.tree.item(main_item, "values")[2] == str(barkod):
+                                trenutna_kolicina = float(self.app.tree.item(main_item, "values")[4])
+                                nova_kolicina = trenutna_kolicina + kolicina
+                                nova_ukupna_cijena = cijena * nova_kolicina
+                                self.app.ukupno -= float(self.app.tree.item(main_item, "values")[5].replace(" KM", ""))
+                                self.app.ukupno += nova_ukupna_cijena
+                                self.app.tree.item(main_item, values=(sifra, naziv, str(barkod), f"{cijena:.2f} KM", nova_kolicina, f"{nova_ukupna_cijena:.2f} KM"))
+                                dodaj_stavku_racuna(self.db_conn, self.core.trenutni_racun_id, sifra, naziv, barkod, cijena, nova_kolicina, nova_ukupna_cijena)
+                                azuriraj_ukupno_racuna(self.db_conn, self.core.trenutni_racun_id, self.app.ukupno)
+                                self.app.cijena_label.configure(text=f"{self.app.ukupno:.2f} KM")
+                                prozor.destroy()
+                                self.app.naziv_var.set("")  # Resetuj samo polje "Naziv"
+                                self.core.izracunaj_ukupnu_cijenu()  # Osvježi ukupnu cijenu, ali ne resetuj polje "Dodatno"
+                                return
+                        item = self.app.tree.insert("", "end", values=(sifra, naziv, str(barkod), f"{cijena:.2f} KM", kolicina, f"{ukupna_cijena:.2f} KM"))
+                        # Dodela boje na osnovu broja redova
+                        if len(self.app.tree.get_children()) % 2 == 0:
+                            self.app.tree.item(item, tags=('evenrow',))
+                        else:
+                            self.app.tree.item(item, tags=('oddrow',))
+                        self.app.ukupno += ukupna_cijena
+                        dodaj_stavku_racuna(self.db_conn, self.core.trenutni_racun_id, sifra, naziv, barkod, cijena, kolicina, ukupna_cijena)
+                        azuriraj_ukupno_racuna(self.db_conn, self.core.trenutni_racun_id, self.app.ukupno)
+                        self.core.izracunaj_ukupnu_cijenu()  # Osvježi ukupnu cijenu, ali ne resetuj polje "Dodatno"
+                        prozor.destroy()
+                        self.app.naziv_var.set("")  # Resetuj samo polje "Naziv"
+
+                    ctk.CTkButton(prozor, text="Dodaj", command=dodaj_selektovano, fg_color=TAMNO_TIRKIZNA, hover_color="#3A8B93", font=self.core.FONT).pack(pady=10)
+                    tree.bind("<Return>", lambda event: dodaj_selektovano())
+                else:
+                    # Ako je pronađen samo jedan artikal, automatski ga dodaj
+                    sifra, barkod, naziv, cijena = rezultati[0]
+                    kolicina = 1.0
+                    ukupna_cijena = cijena * kolicina
+                    for main_item in self.app.tree.get_children():
+                        if self.app.tree.item(main_item, "values")[2] == str(barkod):
+                            trenutna_kolicina = float(self.app.tree.item(main_item, "values")[4])
+                            nova_kolicina = trenutna_kolicina + kolicina
+                            nova_ukupna_cijena = cijena * nova_kolicina
+                            self.app.ukupno -= float(self.app.tree.item(main_item, "values")[5].replace(" KM", ""))
+                            self.app.ukupno += nova_ukupna_cijena
+                            self.app.tree.item(main_item, values=(sifra, naziv, str(barkod), f"{cijena:.2f} KM", nova_kolicina, f"{nova_ukupna_cijena:.2f} KM"))
+                            dodaj_stavku_racuna(self.db_conn, self.core.trenutni_racun_id, sifra, naziv, barkod, cijena, nova_kolicina, nova_ukupna_cijena)
+                            azuriraj_ukupno_racuna(self.db_conn, self.core.trenutni_racun_id, self.app.ukupno)
+                            self.app.cijena_label.configure(text=f"{self.app.ukupno:.2f} KM")
+                            self.app.naziv_var.set("")  # Resetuj samo polje "Naziv"
+                            self.core.izracunaj_ukupnu_cijenu()  # Osvježi ukupnu cijenu, ali ne resetuj polje "Dodatno"
+                            return
+                    item = self.app.tree.insert("", "end", values=(sifra, naziv, str(barkod), f"{cijena:.2f} KM", kolicina, f"{ukupna_cijena:.2f} KM"))
+                    # Dodela boje na osnovu broja redova
+                    if len(self.app.tree.get_children()) % 2 == 0:
+                        self.app.tree.item(item, tags=('evenrow',))
+                    else:
+                        self.app.tree.item(item, tags=('oddrow',))
+                    self.app.ukupno += ukupna_cijena
+                    dodaj_stavku_racuna(self.db_conn, self.core.trenutni_racun_id, sifra, naziv, barkod, cijena, kolicina, ukupna_cijena)
+                    azuriraj_ukupno_racuna(self.db_conn, self.core.trenutni_racun_id, self.app.ukupno)
+                    self.app.naziv_var.set("")  # Resetuj samo polje "Naziv"
+                    self.core.izracunaj_ukupnu_cijenu()  # Osvježi ukupnu cijenu, ali ne resetuj polje "Dodatno"
+            else:
+                messagebox.showerror("Greška", "Nijedan artikal nije pronađen!")
+        except sqlite3.Error as e:
+            messagebox.showerror("Greška", f"Došlo je do greške: {e}")
+        self.core.focus_barkod_entry()
+
+    def pretrazi_barkod(self, event):
+        barkod = self.app.barkod_var.get().strip()
+        if not barkod:
+            return
+        
+        print(f"Skenirani barkod: '{barkod}'")
+        
+        try:
+            c = self.db_conn.cursor()
+            c.execute("SELECT id, naziv, cijena FROM artikli WHERE barkod = ?", (barkod,))
+            rezultat = c.fetchone()
+            print(f"Rezultat pretrage: {rezultat}")
+            
+            if rezultat:
+                sifra, naziv, cijena = rezultat
+                kolicina = 1.0
+                ukupna_cijena = cijena * kolicina
+                for item in self.app.tree.get_children():
+                    if self.app.tree.item(item, "values")[2] == str(barkod):
+                        trenutna_kolicina = float(self.app.tree.item(item, "values")[4])
+                        nova_kolicina = trenutna_kolicina + kolicina
+                        nova_ukupna_cijena = cijena * nova_kolicina
+                        self.app.ukupno -= float(self.app.tree.item(item, "values")[5].replace(" KM", ""))
+                        self.app.ukupno += nova_ukupna_cijena
+                        self.app.tree.item(item, values=(sifra, naziv, str(barkod), f"{cijena:.2f} KM", nova_kolicina, f"{nova_ukupna_cijena:.2f} KM"))
+                        dodaj_stavku_racuna(self.db_conn, self.core.trenutni_racun_id, sifra, naziv, barkod, cijena, nova_kolicina, nova_ukupna_cijena)
+                        azuriraj_ukupno_racuna(self.db_conn, self.core.trenutni_racun_id, self.app.ukupno)
+                        self.app.barkod_var.set("")
+                        self.core.izracunaj_ukupnu_cijenu()
+                        self.core.focus_barkod_entry()
+                        return
+                item = self.app.tree.insert("", "end", values=(sifra, naziv, str(barkod), f"{cijena:.2f} KM", kolicina, f"{ukupna_cijena:.2f} KM"))
+                # Dodela boje na osnovu broja redova
+                if len(self.app.tree.get_children()) % 2 == 0:
+                    self.app.tree.item(item, tags=('evenrow',))
+                else:
+                    self.app.tree.item(item, tags=('oddrow',))
+                self.app.ukupno += ukupna_cijena
+                dodaj_stavku_racuna(self.db_conn, self.core.trenutni_racun_id, sifra, naziv, barkod, cijena, kolicina, ukupna_cijena)
+                azuriraj_ukupno_racuna(self.db_conn, self.core.trenutni_racun_id, self.app.ukupno)
+                self.app.barkod_var.set("")
+                self.core.izracunaj_ukupnu_cijenu()
+            else:
+                messagebox.showerror("Greška", f"Artikal sa barkodom {barkod} nije pronađen!")
+        except sqlite3.Error as e:
+            messagebox.showerror("Greška", f"Došlo je do greške: {e}")
+        self.core.focus_barkod_entry()
+
+    def pretrazi_sifru(self, event):
+        sifra = self.app.sifra_var.get().strip()
+        if not sifra:
+            return
+        
+        rezultat = pretrazi_sifru(self.db_conn, sifra)
+        if rezultat:
+            barkod, naziv, cijena = rezultat
+            kolicina = 1.0
+            ukupna_cijena = cijena * kolicina
+            for item in self.app.tree.get_children():
+                if self.app.tree.item(item, "values")[2] == str(barkod):
+                    trenutna_kolicina = float(self.app.tree.item(item, "values")[4])
+                    nova_kolicina = trenutna_kolicina + kolicina
+                    nova_ukupna_cijena = cijena * nova_kolicina
+                    self.app.ukupno -= float(self.app.tree.item(item, "values")[5].replace(" KM", ""))
+                    self.app.ukupno += nova_ukupna_cijena
+                    self.app.tree.item(item, values=(sifra, naziv, str(barkod), f"{cijena:.2f} KM", nova_kolicina, f"{nova_ukupna_cijena:.2f} KM"))
+                    dodaj_stavku_racuna(self.db_conn, self.core.trenutni_racun_id, sifra, naziv, barkod, cijena, nova_kolicina, nova_ukupna_cijena)
+                    azuriraj_ukupno_racuna(self.db_conn, self.core.trenutni_racun_id, self.app.ukupno)
+                    self.app.sifra_var.set("")
+                    self.core.izracunaj_ukupnu_cijenu()
+                    return
+            item = self.app.tree.insert("", "end", values=(sifra, naziv, str(barkod), f"{cijena:.2f} KM", kolicina, f"{ukupna_cijena:.2f} KM"))
+            # Dodela boje na osnovu broja redova
+            if len(self.app.tree.get_children()) % 2 == 0:
+                self.app.tree.item(item, tags=('evenrow',))
+            else:
+                self.app.tree.item(item, tags=('oddrow',))
+            self.app.ukupno += ukupna_cijena
+            dodaj_stavku_racuna(self.db_conn, self.core.trenutni_racun_id, sifra, naziv, barkod, cijena, kolicina, ukupna_cijena)
+            azuriraj_ukupno_racuna(self.db_conn, self.core.trenutni_racun_id, self.app.ukupno)
+            self.app.sifra_var.set("")
+            self.core.izracunaj_ukupnu_cijenu()
+        else:
+            messagebox.showerror("Greška", "Artikal nije pronađen!")
+        self.core.focus_barkod_entry()
+
+========================================
+# KRAJ DATOTEKE: search_functions.py
+========================================
+
+
+========================================
+# POČETAK DATOTEKE: ui_components.py
+========================================
+import customtkinter as ctk
+from config import SVJETLO_ZELENA, TAMNO_TIRKIZNA
+import tkinter as tk
+import tkinter.ttk as ttk
+import os
+from PIL import Image
+
+def setup_ui(root, app):
+    root.configure(fg_color=SVJETLO_ZELENA)  # Svetlo zelena pozadina
+
+    # Fontovi
+    FONT = ("Segoe UI", 22)
+    FONT_BOLD = ("Segoe UI", 24, "bold")
+    FONT_TABLE = ("Segoe UI", 18)
+    app.FONT = FONT
+    app.FONT_BOLD = FONT_BOLD
+
+    # Podešavanje stila za Treeview
+    style = ttk.Style()
+    style.configure("Treeview", font=FONT_TABLE, rowheight=40)
+    style.configure("Treeview.Heading", font=FONT_TABLE)
+
+    # Levi deo (tabela i unos)
+    left_frame = ctk.CTkFrame(root, fg_color=SVJETLO_ZELENA, corner_radius=10)
+    left_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+
+    entry_frame = ctk.CTkFrame(left_frame, fg_color=SVJETLO_ZELENA)
+    entry_frame.pack(fill="x", padx=10, pady=5)
+    entry_frame.grid_columnconfigure(1, weight=1)
+
+    ctk.CTkLabel(entry_frame, text="Barkod:", font=FONT, text_color="#000000").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+    app.barkod_var = ctk.StringVar()
+    app.barkod_entry = ctk.CTkEntry(entry_frame, textvariable=app.barkod_var, font=FONT, width=100, placeholder_text="Unesi barkod", fg_color="#FFFFFF", text_color="#000000")
+    app.barkod_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+
+    app.artikli_btn = ctk.CTkButton(
+        entry_frame,
+        text="Artikli",
+        image=ctk.CTkImage(light_image=Image.open(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\items.ico")) if os.path.exists(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\items.ico") else None,
+        compound="left",
+        fg_color=TAMNO_TIRKIZNA,
+        hover_color="#3A8B93",
+        font=FONT
+    )
+    app.artikli_btn.grid(row=0, column=2, padx=5, pady=5)
+
+    app.izmjeni_btn = ctk.CTkButton(
+        entry_frame,
+        text="Izmjeni",
+        image=ctk.CTkImage(light_image=Image.open(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\edit.ico")) if os.path.exists(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\edit.ico") else None,
+        compound="left",
+        fg_color=TAMNO_TIRKIZNA,
+        hover_color="#3A8B93",
+        font=FONT
+    )
+    app.izmjeni_btn.grid(row=0, column=3, padx=5, pady=5)
+
+    # Dodavanje novog dugmeta "Novi artikal"
+    app.novi_artikal_btn = ctk.CTkButton(
+        entry_frame,
+        text="Novi artikal",
+        fg_color=TAMNO_TIRKIZNA,
+        hover_color="#3A8B93",
+        font=FONT
+    )
+    app.novi_artikal_btn.grid(row=1, column=2, padx=5, pady=5)
+
+    ctk.CTkLabel(entry_frame, text="Naziv:", font=FONT, text_color="#000000").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+    app.naziv_var = ctk.StringVar()
+    app.naziv_entry = ctk.CTkEntry(entry_frame, textvariable=app.naziv_var, font=FONT, width=100, placeholder_text="Unesi naziv", fg_color="#FFFFFF", text_color="#000000")
+    app.naziv_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+
+    ctk.CTkLabel(entry_frame, text="Šifra:", font=FONT, text_color="#000000").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+    app.sifra_var = ctk.StringVar()
+    app.sifra_entry = ctk.CTkEntry(entry_frame, textvariable=app.sifra_var, font=FONT, width=100, placeholder_text="Unesi šifru", fg_color="#FFFFFF", text_color="#000000")
+    app.sifra_entry.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+
+    ctk.CTkLabel(entry_frame, text="Dodatno:", font=FONT, text_color="#000000").grid(row=3, column=0, padx=5, pady=5, sticky="w")
+    app.dodatno_var = ctk.StringVar(value="0,00")
+    app.dodatno_entry = ctk.CTkEntry(entry_frame, textvariable=app.dodatno_var, font=FONT, width=100, placeholder_text="Unesi dodatnu vrednost", fg_color="#FFFFFF", text_color="#000000")
+    app.dodatno_entry.grid(row=3, column=1, padx=5, pady=5, sticky="ew")
+
+    tree_frame = ctk.CTkFrame(left_frame, fg_color="white", corner_radius=10)
+    tree_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+    app.tree = ttk.Treeview(tree_frame, columns=("Šifra", "Naziv", "Barkod", "Osn. Cijena", "Količina", "Uku. Cijena"), show="headings", selectmode="extended")
+    app.tree.heading("Šifra", text="Šifra ▲▼", command=lambda: sort_column(app.tree, "Šifra", False))
+    app.tree.heading("Naziv", text="Naziv ▲▼", command=lambda: sort_column(app.tree, "Naziv", False))
+    app.tree.heading("Barkod", text="Barkod ▲▼", command=lambda: sort_column(app.tree, "Barkod", False))
+    app.tree.heading("Osn. Cijena", text="Osn. Cijena ▲▼", command=lambda: sort_column(app.tree, "Osn. Cijena", False))
+    app.tree.heading("Količina", text="Količina ▲▼", command=lambda: sort_column(app.tree, "Količina", False))
+    app.tree.heading("Uku. Cijena", text="Uku. Cijena ▲▼", command=lambda: sort_column(app.tree, "Uku. Cijena", False))
+    
+    app.tree.column("Šifra", width=70)
+    app.tree.column("Naziv", width=250)
+    app.tree.column("Barkod", width=200)
+    app.tree.column("Osn. Cijena", width=130)
+    app.tree.column("Količina", width=70)
+    app.tree.column("Uku. Cijena", width=130)
+    
+    app.tree.pack(side="left", fill="both", expand=True)
+
+    scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=app.tree.yview)
+    app.tree.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+
+    app.tree.tag_configure('evenrow', background='#8bd4e3')
+    app.tree.tag_configure('oddrow', background='#8be3dc')
+
+    column_limits = {
+        "Šifra": {"min": 50, "max": 100},
+        "Naziv": {"min": 150, "max": 300},
+        "Barkod": {"min": 150, "max": 250},
+        "Osn. Cijena": {"min": 100, "max": 150},
+        "Količina": {"min": 50, "max": 100},
+        "Uku. Cijena": {"min": 100, "max": 150}
+    }
+
+    def enforce_column_widths(event=None):
+        for col in column_limits:
+            current_width = app.tree.column(col, "width")
+            min_width = column_limits[col]["min"]
+            max_width = column_limits[col]["max"]
+            if current_width < min_width:
+                app.tree.column(col, width=min_width)
+            elif current_width > max_width:
+                app.tree.column(col, width=max_width)
+
+    app.tree.bind("<ButtonRelease-1>", enforce_column_widths)
+    app.tree.bind("<Configure>", enforce_column_widths)
+
+    # Frame za "Svi aktivni računi", "Račun 1", "Raniji računi" ispod tabele
+    racun_frame = ctk.CTkFrame(left_frame, fg_color=SVJETLO_ZELENA)
+    racun_frame.pack(fill="x", padx=10, pady=5)
+    racun_frame.grid_columnconfigure(0, weight=1)
+    racun_frame.grid_columnconfigure(1, weight=1)
+    racun_frame.grid_columnconfigure(2, weight=1)
+
+    app.svi_racuni_btn = ctk.CTkButton(
+        racun_frame,
+        text="Svi aktivni računi",
+        image=ctk.CTkImage(light_image=Image.open(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\receipts.ico")) if os.path.exists(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\receipts.ico") else None,
+        compound="left",
+        fg_color=TAMNO_TIRKIZNA,
+        hover_color="#3A8B93",
+        font=FONT
+    )
+    app.svi_racuni_btn.grid(row=0, column=0, padx=5, pady=5, sticky="e")
+
+    # Centrirani tekst unutar labele pomoću anchor="center"
+    app.trenutni_racun_label = ctk.CTkLabel(racun_frame, text="Račun 1", font=FONT_BOLD, text_color="#000000", anchor="center")
+    # Bez sticky opcije za centriranje labele unutar ćelije
+    app.trenutni_racun_label.grid(row=0, column=1, padx=5, pady=5)
+
+    app.raniji_racuni_btn = ctk.CTkButton(
+        racun_frame,
+        text="Raniji računi",
+        image=ctk.CTkImage(light_image=Image.open(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\history.ico")) if os.path.exists(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\history.ico") else None,
+        compound="left",
+        fg_color=TAMNO_TIRKIZNA,
+        hover_color="#3A8B93",
+        font=FONT
+    )
+    app.raniji_racuni_btn.grid(row=0, column=2, padx=5, pady=5, sticky="w")
+
+    button_frame = ctk.CTkFrame(left_frame, fg_color=SVJETLO_ZELENA)
+    button_frame.pack(fill="x", padx=10, pady=5)
+
+    app.dodaj_btn = ctk.CTkButton(
+        button_frame,
+        text="Dodaj artikal",
+        image=ctk.CTkImage(light_image=Image.open(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\add.ico")) if os.path.exists(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\add.ico") else None,
+        compound="left",
+        fg_color=TAMNO_TIRKIZNA,
+        hover_color="#3A8B93",
+        font=FONT
+    )
+    app.dodaj_btn.pack(side="left", padx=5)
+
+    app.obrisi_btn = ctk.CTkButton(
+        button_frame,
+        text="Obriši",
+        image=ctk.CTkImage(light_image=Image.open(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\delete.ico")) if os.path.exists(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\delete.ico") else None,
+        compound="left",
+        fg_color="#FF6F61",
+        hover_color="#E65A50",
+        font=FONT
+    )
+    app.obrisi_btn.pack(side="left", padx=5)
+
+    app.zavrsi_novi_btn = ctk.CTkButton(
+        button_frame,
+        text="Završi i Novi Račun",
+        image=ctk.CTkImage(light_image=Image.open(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\finish.ico")) if os.path.exists(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\finish.ico") else None,
+        compound="left",
+        fg_color=TAMNO_TIRKIZNA,
+        hover_color="#3A8B93",
+        font=FONT
+    )
+    app.zavrsi_novi_btn.pack(side="left", padx=5)
+
+    # Desni deo (kategorije i total)
+    right_frame = ctk.CTkFrame(root, fg_color=SVJETLO_ZELENA, corner_radius=10)
+    right_frame.pack(side="right", fill="y", padx=10, pady=10)
+
+    category_frame = ctk.CTkFrame(right_frame, fg_color=SVJETLO_ZELENA)
+    category_frame.pack(fill="x", padx=10, pady=5)
+
+    app.voce_btn = ctk.CTkButton(
+        category_frame,
+        text="Voće",
+        image=ctk.CTkImage(light_image=Image.open(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\voce.ico")) if os.path.exists(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\voce.ico") else None,
+        compound="left",
+        fg_color=TAMNO_TIRKIZNA,
+        hover_color="#3A8B93",
+        font=FONT,
+        height=50,
+        command=app.win.prikazi_voce
+    )
+    app.voce_btn.pack(fill="x", pady=2)
+
+    app.povrce_btn = ctk.CTkButton(
+        category_frame,
+        text="Povrće",
+        image=ctk.CTkImage(light_image=Image.open(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\povrce.ico")) if os.path.exists(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\povrce.ico") else None,
+        compound="left",
+        fg_color=TAMNO_TIRKIZNA,
+        hover_color="#3A8B93",
+        font=FONT,
+        height=50,
+        command=app.win.prikazi_povrce
+    )
+    app.povrce_btn.pack(fill="x", pady=2)
+
+    app.hljeb_ljubinje_btn = ctk.CTkButton(
+        category_frame,
+        text="Hljeb Ljubinje",
+        image=ctk.CTkImage(light_image=Image.open(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\hljeb_l.ico")) if os.path.exists(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\hljeb_l.ico") else None,
+        compound="left",
+        fg_color=TAMNO_TIRKIZNA,
+        hover_color="#3A8B93",
+        font=FONT,
+        height=50,
+        command=app.win.prikazi_hljeb_ljubinje
+    )
+    app.hljeb_ljubinje_btn.pack(fill="x", pady=2)
+
+    app.hljeb_dubrave_btn = ctk.CTkButton(
+        category_frame,
+        text="Hljeb Dubrave",
+        image=ctk.CTkImage(light_image=Image.open(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\hljeb_d.ico")) if os.path.exists(r"C:\Users\Danilo Ćorović\Desktop\POS SISTEM\Ikonice\hljeb_d.ico") else None,
+        compound="left",
+        fg_color=TAMNO_TIRKIZNA,
+        hover_color="#3A8B93",
+        font=FONT,
+        height=50,
+        command=app.win.prikazi_hljeb_dubrave
+    )
+    app.hljeb_dubrave_btn.pack(fill="x", pady=2)
+
+    total_frame = ctk.CTkFrame(right_frame, fg_color=SVJETLO_ZELENA)
+    total_frame.pack(fill="x", padx=10, pady=5)
+
+    cijena_frame = ctk.CTkFrame(total_frame, fg_color=TAMNO_TIRKIZNA, corner_radius=10)
+    cijena_frame.pack(anchor="w", padx=5, pady=5)
+    ctk.CTkLabel(cijena_frame, text="Cijena:", font=FONT_BOLD, text_color="#FFFFFF").pack(padx=5, pady=2)
+    app.cijena_label = ctk.CTkLabel(cijena_frame, text="0,00 KM", font=("Segoe UI", 30, "bold"), text_color="#FFFFFF")
+    app.cijena_label.pack(padx=5, pady=2)
+
+    ctk.CTkLabel(total_frame, text="Novac od kupca:", font=FONT, text_color="#000000").pack(anchor="w", padx=5, pady=2)
+    app.novac_var = ctk.StringVar()
+    app.novac_entry = ctk.CTkEntry(total_frame, textvariable=app.novac_var, font=FONT, width=150, fg_color="#FFFFFF", text_color="#000000")
+    app.novac_entry.pack(anchor="w", padx=5, pady=2)
+
+    kusur_frame = ctk.CTkFrame(total_frame, fg_color=TAMNO_TIRKIZNA, corner_radius=10)
+    kusur_frame.pack(anchor="w", padx=5, pady=5)
+    app.kusur_title_label = ctk.CTkLabel(kusur_frame, text="Kusur:", font=FONT_BOLD, text_color="#FFFFFF")
+    app.kusur_title_label.pack(padx=5, pady=2)
+    app.kusur_label = ctk.CTkLabel(kusur_frame, text="0,00 KM", font=("Segoe UI", 25, "bold"), text_color="#FFFFFF")
+    app.kusur_label.pack(padx=5, pady=2)
+
+    # Dodavanje dugmeta "QR Kod" ispod polja "Kusur"
+    qr_button = ctk.CTkButton(total_frame, text="QR Kod", command=app.show_qr_codes, fg_color=TAMNO_TIRKIZNA, hover_color="#3A8B93", font=FONT)
+    qr_button.pack(anchor="w", padx=5, pady=5)
+
+def sort_column(tree, col, reverse):
+    data = [(tree.set(item, col), item) for item in tree.get_children()]
+    try:
+        data.sort(key=lambda x: float(x[0].replace(" KM", "").replace(",", ".")), reverse=reverse)
+    except ValueError:
+        data.sort(key=lambda x: x[0].lower(), reverse=reverse)
+    
+    for index, (val, item) in enumerate(data):
+        tree.move(item, '', index)
+    
+    tree.heading(col, command=lambda: sort_column(tree, col, not reverse))
+========================================
+# KRAJ DATOTEKE: ui_components.py
+========================================
+
+
+========================================
+# POČETAK DATOTEKE: windows.py
+========================================
+import tkinter as tk
+from config import SVJETLO_ZELENA, TAMNO_TIRKIZNA
+from tkinter import ttk, messagebox, filedialog
+import sqlite3
+import pandas as pd
+from PIL import Image, ImageTk
+from database import dodaj_artikal_u_bazu, dodaj_stavku_racuna, azuriraj_ukupno_racuna, get_db_connection
+from article_functions import generisi_qr_kodove
+from receipt_functions import dohvati_aktivne_racune
+import customtkinter as ctk
+
+class WindowManager:
+    def __init__(self, app):
+        self.app = app
+        self.kategorije = {
+            "Voće": [],
+            "Povrće": [],
+            "Hljeb Ljubinje": [],
+            "Hljeb Dubrave": []
+        }
+
+    def dohvati_poslednju_sifru(self):
+        """Dohvata sledeću šifru na osnovu maksimalne vrednosti iz Excel-a."""
+        try:
+            df = pd.read_excel("artikli.xlsx")
+            if df.empty:
+                return 1
+            max_sifra = df['Šifra'].max()
+            return max_sifra + 1 if pd.notna(max_sifra) else 1
+        except Exception as e:
+            print(f"Greška pri čitanju Excela: {e}")
+            return 1
+
+    def prikazi_sve_artikle(self):
+        prozor = tk.Toplevel(self.app.root)
+        prozor.title("Svi Artikli")
+        prozor.geometry("800x600")
+
+        search_frame = tk.Frame(prozor)
+        search_frame.pack(pady=5)
+
+        ttk.Label(search_frame, text="Pretraži:").pack(side=tk.LEFT, padx=5)
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_frame, textvariable=search_var, width=30)
+        search_entry.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(search_frame, text="Traži", command=lambda: azuriraj_pretragu()).pack(side=tk.LEFT, padx=5)
+
+        tree_frame = tk.Frame(prozor)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        tree = ttk.Treeview(tree_frame, columns=("Šifra", "Naziv", "Barkod", "Cijena"), show="headings", selectmode="extended")
+        tree.heading("Šifra", text="Šifra")
+        tree.heading("Naziv", text="Naziv")
+        tree.heading("Barkod", text="Barkod")
+        tree.heading("Cijena", text="Cijena")
+        tree.column("Šifra", width=50)
+        tree.column("Naziv", width=250)
+        tree.column("Barkod", width=150)
+        tree.column("Cijena", width=100)
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def dodaj_selektovani_artikal():
+            selektovano = tree.selection()
+            if not selektovano:
+                messagebox.showwarning("Info", "Nijedan artikal nije selektovan!")
+                return
+            item = selektovano[0]
+            sifra, naziv, barkod, cijena = tree.item(item, "values")
+            cijena = float(cijena.replace(" KM", ""))
+            kolicina = 1.0
+            ukupna_cijena = cijena * kolicina
+            for main_item in self.app.tree.get_children():
+                if self.app.tree.item(main_item, "values")[2] == str(barkod):
+                    trenutna_kolicina = float(self.app.tree.item(main_item, "values")[4])
+                    nova_kolicina = trenutna_kolicina + kolicina
+                    nova_ukupna_cijena = cijena * nova_kolicina
+                    self.app.ukupno -= float(self.app.tree.item(main_item, "values")[5].replace(" KM", ""))
+                    self.app.ukupno += nova_ukupna_cijena
+                    self.app.tree.item(main_item, values=(sifra, naziv, str(barkod), f"{cijena:.2f} KM", nova_kolicina, f"{nova_ukupna_cijena:.2f} KM"))
+                    dodaj_stavku_racuna(self.app.db_conn, self.app.func.trenutni_racun_id, sifra, naziv, barkod, cijena, nova_kolicina, nova_ukupna_cijena)
+                    azuriraj_ukupno_racuna(self.app.db_conn, self.app.func.trenutni_racun_id, self.app.ukupno)
+                    self.app.cijena_label.configure(text=f"{self.app.ukupno:.2f} KM")
+                    prozor.destroy()
+                    return
+            self.app.tree.insert("", "end", values=(sifra, naziv, barkod, f"{cijena:.2f} KM", kolicina, f"{ukupna_cijena:.2f} KM"))
+            self.app.ukupno += ukupna_cijena
+            dodaj_stavku_racuna(self.app.db_conn, self.app.func.trenutni_racun_id, sifra, naziv, barkod, cijena, kolicina, ukupna_cijena)
+            azuriraj_ukupno_racuna(self.app.db_conn, self.app.func.trenutni_racun_id, self.app.ukupno)
+            self.app.cijena_label.configure(text=f"{self.app.ukupno:.2f} KM")
+            prozor.destroy()
+
+        def izmjeni_artikal():
+            selektovano = tree.selection()
+            if not selektovano:
+                messagebox.showwarning("Info", "Nijedan artikal nije selektovan!")
+                return
+            item = selektovano[0]
+            sifra, naziv, barkod, cijena = tree.item(item, "values")
+            cijena = float(cijena.replace(" KM", ""))
+
+            uredi_prozor = tk.Toplevel(self.app.root)
+            uredi_prozor.title("Izmjeni Artikal")
+            uredi_prozor.geometry("400x300")
+
+            ttk.Label(uredi_prozor, text="Barkod:").pack(pady=5)
+            barkod_var = tk.StringVar(value=barkod)
+            barkod_entry = ttk.Entry(uredi_prozor, textvariable=barkod_var)
+            barkod_entry.pack(pady=5)
+
+            ttk.Label(uredi_prozor, text="Naziv:").pack(pady=5)
+            naziv_var = tk.StringVar(value=naziv)
+            naziv_entry = ttk.Entry(uredi_prozor, textvariable=naziv_var)
+            naziv_entry.pack(pady=5)
+
+            ttk.Label(uredi_prozor, text="Cijena:").pack(pady=5)
+            cijena_var = tk.StringVar(value=f"{cijena:.2f}")
+            cijena_entry = ttk.Entry(uredi_prozor, textvariable=cijena_var)
+            cijena_entry.pack(pady=5)
+
+            def spremi_izmjene():
+                novi_barkod = barkod_var.get().strip()
+                novi_naziv = naziv_var.get().strip()
+                nova_cijena_str = cijena_var.get().strip()
+
+                if not novi_barkod or not novi_naziv or not nova_cijna_str:
+                    messagebox.showerror("Greška", "Sva polja su obavezna!")
+                    return
+
+                try:
+                    nova_cijna = float(nova_cijna_str.replace(",", "."))
+                    if nova_cijna <= 0:
+                        messagebox.showerror("Greška", "Cijena mora biti veća od 0!")
+                        return
+                except ValueError:
+                    messagebox.showerror("Greška", "Cijena mora biti broj!")
+                    return
+
+                try:
+                    c = self.app.db_conn.cursor()
+                    c.execute("UPDATE artikli SET barkod = ?, naziv = ?, cijena = ? WHERE id = ?", 
+                              (novi_barkod, novi_naziv, nova_cijna, sifra))
+                    self.app.db_conn.commit()
+                    azuriraj_pretragu()
+                    uredi_prozor.destroy()
+                except sqlite3.Error as e:
+                    messagebox.showerror("Greška", f"Došlo je do greške: {e}")
+
+            ttk.Button(uredi_prozor, text="Spremi", command=spremi_izmjene).pack(pady=20)
+
+        def dodaj_u_kategoriju(kategorija):
+            selektovano = tree.selection()
+            if not selektovano:
+                messagebox.showwarning("Info", "Nijedan artikal nije selektovan!")
+                return
+            item = selektovano[0]
+            sifra, naziv, barkod, cijena = tree.item(item, "values")
+            artikal = (sifra, barkod, naziv, float(cijena.replace(" KM", "")))
+            
+            if artikal not in self.kategorije[kategorija]:
+                self.kategorije[kategorija].append(artikal)
+                messagebox.showinfo("Uspeh", f"Artikal '{naziv}' dodan u '{kategorija}'!")
+            else:
+                messagebox.showinfo("Info", f"Artikal '{naziv}' već postoji u '{kategorija}'!")
+
+        tree.bind("<Return>", lambda event: dodaj_selektovani_artikal())
+        ttk.Button(search_frame, text="Dodaj u tabelu", command=dodaj_selektovani_artikal).pack(side=tk.LEFT, padx=5)
+        ttk.Button(search_frame, text="Uvezi iz Excela", command=self.app.func.uvoz_iz_excela).pack(side=tk.LEFT, padx=5)
+        ttk.Button(search_frame, text="Novi Artikal", command=self.dodaj_novi_artikal).pack(side=tk.LEFT, padx=5)
+        ttk.Button(search_frame, text="Izmjeni Artikal", command=izmjeni_artikal).pack(side=tk.LEFT, padx=5)
+        ttk.Button(search_frame, text="Dodaj u Voće", command=lambda: dodaj_u_kategoriju("Voće")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(search_frame, text="Dodaj u Povrće", command=lambda: dodaj_u_kategoriju("Povrće")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(search_frame, text="Dodaj u Hljeb Ljubinje", command=lambda: dodaj_u_kategoriju("Hljeb Ljubinje")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(search_frame, text="Dodaj u Hljeb Dubrave", command=lambda: dodaj_u_kategoriju("Hljeb Dubrave")).pack(side=tk.LEFT, padx=5)
+
+        def azuriraj_pretragu():
+            unos = search_var.get().strip().lower()
+            tree.delete(*tree.get_children())
+            try:
+                c = self.app.db_conn.cursor()
+                if unos:
+                    c.execute("SELECT id, barkod, naziv, cijena FROM artikli WHERE naziv LIKE ? OR barkod LIKE ? ORDER BY id", (f"%{unos}%", f"%{unos}%"))
+                else:
+                    c.execute("SELECT id, barkod, naziv, cijena FROM artikli ORDER BY id")
+                artikli = c.fetchall()
+                for artikal in artikli:
+                    sifra, barkod, naziv, cijena = artikal
+                    tree.insert("", "end", values=(sifra, naziv, barkod, f"{cijena:.2f} KM"))
+            except sqlite3.Error as e:
+                messagebox.showerror("Greška", f"Došlo je do greške: {e}")
+
+        search_entry.bind("<Return>", lambda event: azuriraj_pretragu())
+        azuriraj_pretragu()
+
+    def prikazi_voce(self):
+        self.prikazi_kategoriju("Voće")
+
+    def prikazi_povrce(self):
+        self.prikazi_kategoriju("Povrće")
+
+    def prikazi_hljeb_ljubinje(self):
+        self.prikazi_kategoriju("Hljeb Ljubinje")
+
+    def prikazi_hljeb_dubrave(self):
+        self.prikazi_kategoriju("Hljeb Dubrave")
+
+    def prikazi_kategoriju(self, naziv_kategorije):
+        prozor = ctk.CTkToplevel(self.app.root)
+        prozor.title(naziv_kategorije)
+        prozor.geometry("1200x800")
+        prozor.configure(fg_color=SVJETLO_ZELENA)
+
+        scroll_frame = ctk.CTkScrollableFrame(prozor, fg_color=SVJETLO_ZELENA)
+        scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        artikli = self.kategorije.get(naziv_kategorije, [])
+        if not artikli:
+            ctk.CTkLabel(scroll_frame, text=f"Nema artikala u kategoriji '{naziv_kategorije}'. Dodaj ih putem 'Svi Artikli'.", font=("Arial", 14)).pack(pady=20)
+            return
+
+        def dodaj_sliku(artikal_id, frame, img_label):
+            image_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg")])
+            if image_path:
+                try:
+                    c = self.app.db_conn.cursor()
+                    c.execute("UPDATE artikli SET image_path = ? WHERE id = ?", (image_path, artikal_id))
+                    self.app.db_conn.commit()
+
+                    img = Image.open(image_path).resize((100, 100), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    img_label.configure(image=photo)
+                    frame.image = photo
+                except Exception as e:
+                    messagebox.showerror("Greška", f"Nije moguće dodati sliku: {e}")
+
+        for i, artikal in enumerate(artikli):
+            artikal_id, barkod, naziv, cijena = artikal
+            frame = ctk.CTkFrame(scroll_frame, fg_color="white", corner_radius=10, width=200, height=200)
+            frame.grid(row=i//3, column=i%3, padx=10, pady=10, sticky="nsew")
+
+            image_path = self.app.db_conn.cursor().execute("SELECT image_path FROM artikli WHERE id = ?", (artikal_id,)).fetchone()
+            if image_path and image_path[0]:
+                try:
+                    img = Image.open(image_path[0]).resize((50, 50), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    img_label = ctk.CTkLabel(frame, image=photo, text="")
+                    img_label.image = photo
+                except Exception as e:
+                    img_label = ctk.CTkLabel(frame, text="Slika nije učitana")
+            else:
+                img_label = ctk.CTkLabel(frame, text="Nema slike")
+            img_label.pack(pady=2)
+
+            ctk.CTkButton(frame, text="Dodaj sliku", command=lambda aid=artikal_id, f=frame, il=img_label: dodaj_sliku(aid, f, il), fg_color=TAMNO_TIRKIZNA).pack(pady=2)
+
+            ctk.CTkLabel(frame, text=f"Naziv: {naziv}", font=("Arial", 10)).pack()
+            ctk.CTkLabel(frame, text=f"Cijena: {cijena:.2f} KM", font=("Arial", 10, "bold")).pack()
+            ctk.CTkLabel(frame, text=f"Šifra: {artikal_id}", font=("Arial", 10)).pack()
+            ctk.CTkLabel(frame, text=f"Barkod: {barkod}", font=("Arial", 10)).pack()
+
+            frame.bind("<Button-1>", lambda event, a=artikal: self.dodaj_na_racun(a))
+            for child in frame.winfo_children():
+                if not isinstance(child, ctk.CTkButton):
+                    child.bind("<Button-1>", lambda event, a=artikal: self.dodaj_na_racun(a))
+
+    def dodaj_na_racun(self, artikal):
+        sifra, barkod, naziv, cijena = artikal
+        cijena = float(cijena)
+        kolicina = 1.0
+        ukupna_cijena = cijena * kolicina
+
+        for main_item in self.app.tree.get_children():
+            if self.app.tree.item(main_item, "values")[2] == str(barkod):
+                trenutna_kolicina = float(self.app.tree.item(main_item, "values")[4])
+                nova_kolicina = trenutna_kolicina + kolicina
+                nova_ukupna_cijena = cijena * nova_kolicina
+                self.app.ukupno -= float(self.app.tree.item(main_item, "values")[5].replace(" KM", ""))
+                self.app.ukupno += nova_ukupna_cijena
+                self.app.tree.item(main_item, values=(sifra, naziv, str(barkod), f"{cijena:.2f} KM", nova_kolicina, f"{nova_ukupna_cijena:.2f} KM"))
+                dodaj_stavku_racuna(self.app.db_conn, self.app.func.trenutni_racun_id, sifra, naziv, barkod, cijena, nova_kolicina, nova_ukupna_cijena)
+                azuriraj_ukupno_racuna(self.app.db_conn, self.app.func.trenutni_racun_id, self.app.ukupno)
+                self.app.cijena_label.configure(text=f"{self.app.ukupno:.2f} KM")
+                return
+
+        self.app.tree.insert("", "end", values=(sifra, naziv, barkod, f"{cijena:.2f} KM", kolicina, f"{ukupna_cijena:.2f} KM"))
+        self.app.ukupno += ukupna_cijena
+        dodaj_stavku_racuna(self.app.db_conn, self.app.func.trenutni_racun_id, sifra, naziv, barkod, cijena, kolicina, ukupna_cijena)
+        azuriraj_ukupno_racuna(self.app.db_conn, self.app.func.trenutni_racun_id, self.app.ukupno)
+        self.app.cijena_label.configure(text=f"{self.app.ukupno:.2f} KM")
+
+    def dodaj_novi_artikal(self):
+        print("Pozvana funkcija: dodaj_novi_artikal")
+        prozor = tk.Toplevel(self.app.root)
+        prozor.title("Novi Artikal")
+        prozor.geometry("400x500")
+
+        nova_sifra = self.dohvati_poslednju_sifru()
+        print(f"Nova šifra iz Excela: {nova_sifra}")
+
+        ttk.Label(prozor, text=f"Šifra: {nova_sifra}", font=("Arial", 12, "bold")).pack(pady=10)
+
+        ttk.Label(prozor, text="Barkod:").pack(pady=5)
+        barkod_var = tk.StringVar()
+        barkod_entry = ttk.Entry(prozor, textvariable=barkod_var)
+        barkod_entry.pack(pady=5)
+
+        ttk.Label(prozor, text="Naziv artikla:").pack(pady=5)
+        naziv_var = tk.StringVar()
+        naziv_entry = ttk.Entry(prozor, textvariable=naziv_var)
+        naziv_entry.pack(pady=5)
+
+        ttk.Label(prozor, text="Cijena:").pack(pady=5)
+        cijena_var = tk.StringVar()
+        cijena_entry = ttk.Entry(prozor, textvariable=cijena_var)
+        cijena_entry.pack(pady=5)
+
+        def spremi_novi_artikal():
+            print("Kliknuto dugme 'Spremi' u dodaj_novi_artikal")
+            barkod = barkod_var.get().strip()
+            naziv = naziv_var.get().strip()
+            cijena_str = cijena_var.get().strip()
+            
+            print(f"Uneseni podaci - Barkod: {barkod}, Naziv: {naziv}, Cijena: {cijena_str}")
+
+            if not barkod or not naziv or not cijena_str:
+                messagebox.showerror("Greška", "Sva polja su obavezna!")
+                print("Greška: Sva polja nisu popunjena")
+                return
+            
+            try:
+                cijena = float(cijena_str.replace(",", "."))
+                print(f"Cijena pretvorena u float: {cijena}")
+            except ValueError:
+                messagebox.showerror("Greška", "Cijena mora biti broj!")
+                print("Greška: Cijena nije validan broj")
+                return
+            
+            if cijena <= 0:
+                messagebox.showerror("Greška", "Cijena mora biti veća od 0!")
+                print("Greška: Cijena je <= 0")
+                return
+
+            try:
+                if dodaj_artikal_u_bazu(self.app.db_conn, barkod, naziv, cijena):
+                    messagebox.showinfo("Uspeh", f"Artikal je uspešno dodat sa šifrom {nova_sifra}!")
+                    print("Artikal uspešno dodat u bazu")
+                    prozor.destroy()
+                else:
+                    messagebox.showerror("Greška", "Neuspešno dodavanje artikla u bazu!")
+                    print("Greška: dodaj_artikal_u_bazu vratila False")
+            except sqlite3.Error as e:
+                messagebox.showerror("Greška", f"Došlo je do greške pri dodavanju artikla: {e}")
+                print(f"Greška u bazi: {e}")
+
+        ttk.Button(prozor, text="Spremi", command=spremi_novi_artikal).pack(pady=20)
+
+    def otvori_artikli_prozor(self):
+        print("Pozvana funkcija: otvori_artikli_prozor")
+        prozor = ctk.CTkToplevel(self.app.root)
+        prozor.title("Unos Artikla")
+        prozor.geometry("400x500")
+
+        nova_sifra = self.dohvati_poslednju_sifru()
+        print(f"Nova šifra iz Excela: {nova_sifra}")
+
+        ctk.CTkLabel(prozor, text=f"Šifra: {nova_sifra}", font=("Arial", 12, "bold"), text_color="white").pack(pady=10)
+
+        ctk.CTkLabel(prozor, text="Barkod:", font=("Arial", 12)).pack(pady=5)
+        barkod_var = ctk.StringVar()
+        barkod_entry = ctk.CTkEntry(prozor, textvariable=barkod_var)
+        barkod_entry.pack(pady=5)
+
+        ctk.CTkLabel(prozor, text="Naziv artikla:", font=("Arial", 12)).pack(pady=5)
+        naziv_var = ctk.StringVar()
+        naziv_entry = ctk.CTkEntry(prozor, textvariable=naziv_var)
+        naziv_entry.pack(pady=5)
+
+        ctk.CTkLabel(prozor, text="Cijena:", font=("Arial", 12)).pack(pady=5)
+        cijena_var = ctk.StringVar()
+        cijena_entry = ctk.CTkEntry(prozor, textvariable=cijena_var)
+        cijena_entry.pack(pady=5)
+
+        def dodaj_artikal_u_bazu_wrapper():
+            print("Kliknuto dugme 'Dodaj Artikal' u otvori_artikli_prozor")
+            barkod = barkod_var.get().strip()
+            naziv = naziv_var.get().strip()
+            cijena_str = cijena_var.get().strip()
+
+            print(f"Uneseni podaci - Barkod: {barkod}, Naziv: {naziv}, Cijena: {cijena_str}")
+
+            if not naziv or not barkod or not cijena_str:
+                messagebox.showerror("Greška", "Sva polja su obavezna!")
+                print("Greška: Sva polja nisu popunjena")
+                return
+            
+            try:
+                cijena = float(cijena_str.replace(",", "."))
+                print(f"Cijena pretvorena u float: {cijena}")
+            except ValueError:
+                messagebox.showerror("Greška", "Cijena mora biti broj (npr. 10.50 ili 10,50)!")
+                print("Greška: Cijena nije validan broj")
+                return
+            
+            if cijena <= 0:
+                messagebox.showerror("Greška", "Cijena mora biti veća od 0!")
+                print("Greška: Cijena je <= 0")
+                return
+            
+            try:
+                if dodaj_artikal_u_bazu(self.app.db_conn, barkod, naziv, cijena):
+                    messagebox.showinfo("Uspeh", f"Artikal je uspešno dodat sa šifrom {nova_sifra}!")
+                    print("Artikal uspešno dodat u bazu")
+                    prozor.destroy()
+                else:
+                    messagebox.showerror("Greška", "Neuspešno dodavanje artikla u bazu!")
+                    print("Greška: dodaj_artikal_u_bazu vratila False")
+            except sqlite3.Error as e:
+                messagebox.showerror("Greška", f"Došlo je do greške pri dodavanju artikla: {e}")
+                print(f"Greška u bazi: {e}")
+
+        ctk.CTkButton(prozor, text="Dodaj Artikal", command=dodaj_artikal_u_bazu_wrapper, fg_color=TAMNO_TIRKIZNA).pack(pady=20)
+
+    def otvori_raniji_racuni_prozor(self):
+        """Prikazuje prozor sa listom ranijih računa."""
+        prozor = ctk.CTkToplevel(self.app.root)
+        prozor.title("Raniji Računi")
+        prozor.geometry("900x900")
+        prozor.configure(fg_color=SVJETLO_ZELENA)
+
+        tree_frame = tk.Frame(prozor)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        columns = ("racun_id", "datum", "ukupno")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
+        tree.heading("racun_id", text="ID Računa")
+        tree.heading("datum", text="Datum")
+        tree.heading("ukupno", text="Ukupno (KM)")
+        tree.column("racun_id", width=100)
+        tree.column("datum", width=200)
+        tree.column("ukupno", width=150)
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Dohvatanje računa iz baze
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, datum_vrijeme, ukupno FROM racuni ORDER BY datum_vrijeme DESC")
+            racuni = cursor.fetchall()
+            for racun in racuni:
+                racun_id, datum, ukupno = racun
+                tree.insert("", tk.END, values=(racun_id, datum, f"{ukupno:.2f} KM"))
+            conn.close()
+        except sqlite3.Error as e:
+            messagebox.showerror("Greška", f"Došlo je do greške: {e}")
+
+        # Otvaranje detalja računa na dvoklik
+        tree.bind("<Double-1>", lambda event: self.otvori_raniji_racun_prozor(tree))
+
+    def otvori_raniji_racun_prozor(self, tree):
+        """Prikazuje detalje odabranog računa sa dugmetom za QR kod."""
+        selected_item = tree.selection()
+        if not selected_item:
+            messagebox.showwarning("Upozorenje", "Odaberite račun!")
+            return
+
+        racun_id = tree.item(selected_item)['values'][0]
+        prozor = ctk.CTkToplevel(self.app.root)
+        prozor.title(f"Račun {racun_id}")
+        prozor.geometry("800x600")
+        prozor.configure(fg_color=SVJETLO_ZELENA)
+
+        tree_frame = tk.Frame(prozor)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        columns = ("barkod", "naziv", "kolicina", "cena", "ukupno")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
+        tree.heading("barkod", text="Barkod")
+        tree.heading("naziv", text="Naziv")
+        tree.heading("kolicina", text="Količina")
+        tree.heading("cena", text="Cena (KM)")
+        tree.heading("ukupno", text="Ukupno (KM)")
+        tree.column("barkod", width=150)
+        tree.column("naziv", width=250)
+        tree.column("kolicina", width=100)
+        tree.column("cena", width=100)
+        tree.column("ukupno", width=100)
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Dohvatanje stavki računa
+        try:
+            conn = get_db_connection()
+            stavke = dohvati_stavke_racuna(conn, racun_id)
+            for stavka in stavke:
+                barkod, naziv, kolicina, cijena, ukupna_cijena = stavka
+                tree.insert("", tk.END, values=(barkod, naziv, kolicina, f"{cijena:.2f}", f"{ukupna_cijena:.2f}"))
+            conn.close()
+        except sqlite3.Error as e:
+            messagebox.showerror("Greška", f"Došlo je do greške: {e}")
+
+        # Dugme za QR kod
+        qr_btn = ctk.CTkButton(
+            prozor,
+            text="QR Kod",
+            command=lambda: self.prikazi_qr_kodove_za_racun(stavke),
+            fg_color=TAMNO_TIRKIZNA,
+            hover_color="#008B5A"
+        )
+        qr_btn.pack(pady=10)
+
+    def prikazi_qr_kodove_za_racun(self, stavke):
+        """Prikazuje QR kodove za artikle sa računa."""
+        prozor = ctk.CTkToplevel(self.app.root)
+        prozor.title("QR Kodovi Artikala")
+        prozor.geometry("900x900")
+        prozor.configure(fg_color=SVJETLO_ZELENA)
+
+        canvas = tk.Canvas(prozor)
+        scrollbar = ttk.Scrollbar(prozor, orient="vertical", command=canvas.yview)
+        scrollable_frame = ctk.CTkFrame(canvas, fg_color=SVJETLO_ZELENA)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Generisanje QR kodova
+        qr_images = generisi_qr_kodove([{'barkod': s['barkod'], 'naziv': s['naziv']} for s in stavke])
+        for stavka, qr_image in zip(stavke, qr_images):
+            frame = ctk.CTkFrame(scrollable_frame, fg_color="white")
+            frame.pack(pady=10, padx=10, fill="x")
+
+            label = ctk.CTkLabel(frame, text=f"Artikal: {stavka['naziv']} ({stavka['barkod']})")
+            label.pack()
+
+            qr_label = tk.Label(frame, image=qr_image)
+            qr_label.image = qr_image  # Čuvanje reference
+            qr_label.pack()
+========================================
+# KRAJ DATOTEKE: windows.py
+========================================
+
